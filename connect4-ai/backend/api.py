@@ -5,7 +5,7 @@ from typing import List
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from .agent import QLearningAgent
+from .agent import DQNAgent, DEVICE
 from .game import get_legal_moves, make_move, check_winner, is_draw, ROWS, COLS
 from .train import get_alphabeta_action
 
@@ -14,44 +14,42 @@ app = Flask(__name__)
 CORS(app, resources={r"*": {"origins": ["http://localhost:5174", "http://localhost:5175"]}})
 
 
-Q_TABLE_PATH = os.path.join(os.path.dirname(__file__), "q_table.pkl")
-
-_Q_TABLE_TRAINED_THRESHOLD = 500
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "dqn_model.pt")
 
 
 def perspective(board: List[int], player: int) -> List[int]:
     return [v * player for v in board]
 
 
-def load_agent() -> QLearningAgent:
-    if os.path.exists(Q_TABLE_PATH):
+def _load_agent() -> DQNAgent:
+    if os.path.exists(MODEL_PATH):
         try:
-            agent = QLearningAgent.load(Q_TABLE_PATH)
+            import torch
+            agent = DQNAgent.load(MODEL_PATH, map_location=torch.device("cpu"))
             agent.epsilon = 0.0
+            agent.policy_net.eval()
             return agent
         except Exception:
             pass
-    return QLearningAgent(epsilon=0.0)
+    return DQNAgent(epsilon=0.0)
 
 
-agent = load_agent()
-
-
-def _is_trained() -> bool:
-    return len(agent.q_table) >= _Q_TABLE_TRAINED_THRESHOLD
+agent = _load_agent()
+_model_loaded = os.path.exists(MODEL_PATH)
 
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "q_states": len(agent.q_table), "trained": _is_trained()})
+    return jsonify({"status": "ok", "model_loaded": _model_loaded})
 
 
 @app.post("/reload")
-def reload_qtable():
-    global agent
+def reload_model():
+    global agent, _model_loaded
     try:
-        agent = load_agent()
-        return jsonify({"status": "reloaded", "q_states": len(agent.q_table)})
+        agent = _load_agent()
+        _model_loaded = os.path.exists(MODEL_PATH)
+        return jsonify({"status": "reloaded", "model_loaded": _model_loaded})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -59,8 +57,8 @@ def reload_qtable():
 @app.post("/move")
 def move():
     data = request.get_json(force=True)
-    board = data.get("board")
-    player = data.get("player")
+    board      = data.get("board")
+    player     = data.get("player")
     difficulty = (data.get("difficulty") or "hard").lower()
 
     if not isinstance(board, list) or len(board) != ROWS * COLS:
@@ -76,19 +74,19 @@ def move():
     if difficulty == "easy":
         col = random.choice(legal)
     elif difficulty == "medium":
-        if _is_trained() and random.random() < 0.5:
+        if _model_loaded and random.random() < 0.5:
             col = agent.get_greedy_action(perspective(board, player))
         else:
             col = get_alphabeta_action(board, player, depth=3)
     else:  # hard
-        if _is_trained():
+        if _model_loaded:
             col = agent.get_greedy_action(perspective(board, player))
         else:
             col = get_alphabeta_action(board, player, depth=6)
 
     new_board = make_move(board, col, player)
 
-    # find the board index where the piece landed
+    # Determine the board index where the piece landed
     position = next(
         r * COLS + col
         for r in range(ROWS)
@@ -100,8 +98,8 @@ def move():
 
     return jsonify({
         "position": position,
-        "winner": int(w) if w != 0 else None,
-        "is_draw": bool(d),
+        "winner":   int(w) if w != 0 else None,
+        "is_draw":  bool(d),
     })
 
 
